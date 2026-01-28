@@ -145,6 +145,7 @@ func (m *Manager) ValidateToken(accessToken string) (*TokenInfo, error) {
 		Error  string `json:"error"`
 		UserID string `json:"user_id"`
 		TeamID string `json:"team_id"`
+		URL    string `json:"url"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -158,6 +159,7 @@ func (m *Manager) ValidateToken(accessToken string) (*TokenInfo, error) {
 	return &TokenInfo{
 		UserID: result.UserID,
 		TeamID: result.TeamID,
+		URL:    result.URL,
 	}, nil
 }
 

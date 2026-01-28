@@ -76,7 +76,12 @@ func (ch *ChannelsHandler) getSlackClient(ctx context.Context) (*slack.Client, e
 	}
 
 	// Use token directly from context (already validated by middleware)
-	return slack.New(userCtx.AccessToken), nil
+	// Set API URL from auth.test response to support external tokens and GovSlack
+	opts := []slack.Option{}
+	if userCtx.URL != "" {
+		opts = append(opts, slack.OptionAPIURL(userCtx.URL+"api/"))
+	}
+	return slack.New(userCtx.AccessToken, opts...), nil
 }
 
 func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {

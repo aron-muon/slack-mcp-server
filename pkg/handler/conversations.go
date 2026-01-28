@@ -118,7 +118,12 @@ func (h *ConversationsHandler) getSlackClient(ctx context.Context) (*slack.Clien
 	}
 
 	// Use user token by default
-	return slack.New(userCtx.AccessToken), nil
+	// Set API URL from auth.test response to support external tokens and GovSlack
+	opts := []slack.Option{}
+	if userCtx.URL != "" {
+		opts = append(opts, slack.OptionAPIURL(userCtx.URL+"api/"))
+	}
+	return slack.New(userCtx.AccessToken, opts...), nil
 }
 
 // getBotSlackClient creates a Slack client using bot token (OAuth mode)
@@ -138,7 +143,12 @@ func (h *ConversationsHandler) getBotSlackClient(ctx context.Context) (*slack.Cl
 	}
 
 	// Use bot token
-	return slack.New(userCtx.BotToken), nil
+	// Set API URL from auth.test response to support external tokens and GovSlack
+	opts := []slack.Option{}
+	if userCtx.URL != "" {
+		opts = append(opts, slack.OptionAPIURL(userCtx.URL+"api/"))
+	}
+	return slack.New(userCtx.BotToken, opts...), nil
 }
 
 // getProvider returns the provider (legacy mode) or error (OAuth mode)
