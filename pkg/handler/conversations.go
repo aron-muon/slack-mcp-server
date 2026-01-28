@@ -321,7 +321,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 	}
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false)
+	messages := ch.convertMessagesFromHistory(ctx, slackClient, history.Messages, historyParams.ChannelID, false)
 	return marshalMessagesToCSV(messages)
 }
 
@@ -374,7 +374,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(ctx, slackClient, history.Messages, params.channel, params.activity)
 
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
@@ -431,7 +431,7 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 	}
 	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
 
-	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(ctx, slackClient, replies, params.channel, params.activity)
 	if len(messages) > 0 && hasMore {
 		messages[len(messages)-1].Cursor = nextCursor
 	}
@@ -478,7 +478,7 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	}
 	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
 
-	messages := ch.convertMessagesFromSearch(messagesRes.Matches)
+	messages := ch.convertMessagesFromSearch(ctx, slackClient, messagesRes.Matches)
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
 		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
@@ -508,17 +508,21 @@ func isChannelAllowed(channel string) bool {
 	return !isNegated
 }
 
-func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool) []Message {
+func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, slackClient *slack.Client, slackMessages []slack.Message, channel string, includeActivity bool) []Message {
 	// Get users map (if available)
-	var usersMap *provider.UsersCache
+	var usersMap map[string]slack.User
 	if !ch.oauthEnabled {
-		usersMap = ch.apiProvider.ProvideUsersMap()
+		cache := ch.apiProvider.ProvideUsersMap()
+		usersMap = cache.Users
 	} else {
-		// OAuth mode: no cache, use empty map
-		usersMap = &provider.UsersCache{
-			Users:    make(map[string]slack.User),
-			UsersInv: make(map[string]string),
+		// OAuth mode: fetch user info from Slack API
+		var userIDs []string
+		for _, msg := range slackMessages {
+			if msg.User != "" {
+				userIDs = append(userIDs, msg.User)
+			}
 		}
+		usersMap = ch.fetchUsersForMessages(ctx, slackClient, userIDs)
 	}
 	var messages []Message
 	warn := false
@@ -528,7 +532,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 			continue
 		}
 
-		userName, realName, ok := getUserInfo(msg.User, usersMap.Users)
+		userName, realName, ok := getUserInfo(msg.User, usersMap)
 
 		if !ok && msg.SubType == "bot_message" {
 			userName, realName, ok = getBotInfo(msg.Username)
@@ -578,23 +582,27 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 	return messages
 }
 
-func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage) []Message {
+func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, slackClient *slack.Client, slackMessages []slack.SearchMessage) []Message {
 	// Get users map (if available)
-	var usersMap *provider.UsersCache
+	var usersMap map[string]slack.User
 	if !ch.oauthEnabled {
-		usersMap = ch.apiProvider.ProvideUsersMap()
+		cache := ch.apiProvider.ProvideUsersMap()
+		usersMap = cache.Users
 	} else {
-		// OAuth mode: no cache, use empty map
-		usersMap = &provider.UsersCache{
-			Users:    make(map[string]slack.User),
-			UsersInv: make(map[string]string),
+		// OAuth mode: fetch user info from Slack API
+		var userIDs []string
+		for _, msg := range slackMessages {
+			if msg.User != "" {
+				userIDs = append(userIDs, msg.User)
+			}
 		}
+		usersMap = ch.fetchUsersForMessages(ctx, slackClient, userIDs)
 	}
 	var messages []Message
 	warn := false
 
 	for _, msg := range slackMessages {
-		userName, realName, ok := getUserInfo(msg.User, usersMap.Users)
+		userName, realName, ok := getUserInfo(msg.User, usersMap)
 
 		if !ok && msg.User == "" && msg.Username != "" {
 			userName, realName, ok = getBotInfo(msg.Username)
@@ -932,6 +940,38 @@ func getUserInfo(userID string, usersMap map[string]slack.User) (userName, realN
 		return u.Name, u.RealName, true
 	}
 	return userID, userID, false
+}
+
+// fetchUsersForMessages fetches user info from Slack API for the given user IDs
+// and returns a map of userID -> slack.User. This is used in OAuth mode where
+// we don't have a pre-populated users cache.
+func (ch *ConversationsHandler) fetchUsersForMessages(ctx context.Context, client *slack.Client, userIDs []string) map[string]slack.User {
+	usersMap := make(map[string]slack.User)
+	if client == nil {
+		return usersMap
+	}
+
+	// Deduplicate user IDs
+	seen := make(map[string]bool)
+	var uniqueIDs []string
+	for _, id := range userIDs {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+
+	// Fetch each user's info
+	for _, userID := range uniqueIDs {
+		user, err := client.GetUserInfoContext(ctx, userID)
+		if err != nil {
+			ch.logger.Debug("Failed to fetch user info", zap.String("userID", userID), zap.Error(err))
+			continue
+		}
+		usersMap[userID] = *user
+	}
+
+	return usersMap
 }
 
 func getBotInfo(botID string) (userName, realName string, ok bool) {
