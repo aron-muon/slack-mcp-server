@@ -27,8 +27,8 @@ type Channel struct {
 }
 
 type ChannelsHandler struct {
-	apiProvider  *provider.ApiProvider  // Legacy mode
-	tokenStorage oauth.TokenStorage     // OAuth mode
+	apiProvider  *provider.ApiProvider // Legacy mode
+	tokenStorage oauth.TokenStorage    // OAuth mode
 	oauthEnabled bool
 	validTypes   map[string]bool
 	logger       *zap.Logger
@@ -473,4 +473,3 @@ func (ch *ChannelsHandler) channelsHandlerOAuth(ctx context.Context, request mcp
 	ch.logger.Debug("Returning channels", zap.Int("count", len(allChannels)))
 	return mcp.NewToolResultText(string(csvBytes)), nil
 }
-

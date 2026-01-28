@@ -81,8 +81,8 @@ type addMessageParams struct {
 }
 
 type ConversationsHandler struct {
-	apiProvider  *provider.ApiProvider  // Legacy mode
-	tokenStorage oauth.TokenStorage     // OAuth mode
+	apiProvider  *provider.ApiProvider // Legacy mode
+	tokenStorage oauth.TokenStorage    // OAuth mode
 	oauthEnabled bool
 	logger       *zap.Logger
 }
@@ -341,7 +341,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		zap.String("thread_ts", params.threadTs),
 		zap.String("content_type", params.contentType),
 	)
-	
+
 	var respChannel, respTimestamp string
 	if ch.oauthEnabled {
 		respChannel, respTimestamp, err = slackClient.PostMessageContext(ctx, params.channel, options...)
@@ -374,7 +374,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		Latest:    respTimestamp,
 		Inclusive: true,
 	}
-	
+
 	var history *slack.GetConversationHistoryResponse
 	if ch.oauthEnabled {
 		if slackClient == nil {
@@ -433,7 +433,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	
+
 	var history *slack.GetConversationHistoryResponse
 	if ch.oauthEnabled {
 		if slackClient == nil {
@@ -496,7 +496,7 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	
+
 	var replies []slack.Message
 	var hasMore bool
 	var nextCursor string
@@ -545,7 +545,7 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		Count:         params.limit,
 		Page:          params.page,
 	}
-	
+
 	var messagesRes *slack.SearchMessages
 	if ch.oauthEnabled {
 		messagesRes, _, err = slackClient.SearchContext(ctx, params.query, searchParams)
