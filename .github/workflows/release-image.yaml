@@ -6,8 +6,8 @@ on:
       - '*'
 
 env:
-  DOCKERHUB_IMAGE_NAME: korotovsky/slack-mcp-server
-  DOCKERHUB_USERNAME: korotovsky
+  DOCKERHUB_IMAGE_NAME: aron-muon/slack-mcp-server
+  DOCKERHUB_USERNAME: aron-muon
   TAG: ${{ github.ref_name == 'main' && 'latest' || github.ref_type == 'tag' && github.ref_name && startsWith(github.ref_name, 'v') && github.ref_name || 'unknown' }}
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
