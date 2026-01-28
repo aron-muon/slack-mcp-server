@@ -311,6 +311,9 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 	
 	var history *slack.GetConversationHistoryResponse
 	if ch.oauthEnabled {
+		if slackClient == nil {
+			return nil, fmt.Errorf("slack client is nil in OAuth mode")
+		}
 		history, err = slackClient.GetConversationHistoryContext(ctx, &historyParams)
 	} else {
 		history, err = ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
@@ -318,6 +321,10 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
+	}
+	if history == nil {
+		ch.logger.Error("GetConversationHistoryContext returned nil response")
+		return nil, fmt.Errorf("failed to get conversation history: nil response")
 	}
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
@@ -363,6 +370,9 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 	
 	var history *slack.GetConversationHistoryResponse
 	if ch.oauthEnabled {
+		if slackClient == nil {
+			return nil, fmt.Errorf("slack client is nil in OAuth mode")
+		}
 		history, err = slackClient.GetConversationHistoryContext(ctx, &historyParams)
 	} else {
 		history, err = ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
@@ -370,6 +380,10 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
+	}
+	if history == nil {
+		ch.logger.Error("GetConversationHistoryContext returned nil response")
+		return nil, fmt.Errorf("failed to get conversation history: nil response")
 	}
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
@@ -678,6 +692,11 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	}
 
 	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
+		// OAuth mode doesn't have a channel cache - require channel IDs
+		if ch.oauthEnabled {
+			ch.logger.Error("Channel name not supported in OAuth mode", zap.String("channel", channel))
+			return nil, fmt.Errorf("channel name %q is not supported in OAuth mode. Please use the channel ID (e.g., 'C1234567890') instead. You can get channel IDs from the channels_list tool", channel)
+		}
 		if ready, err := ch.apiProvider.IsReady(); !ready {
 			if errors.Is(err, provider.ErrUsersNotReady) {
 				ch.logger.Warn(
@@ -966,6 +985,10 @@ func (ch *ConversationsHandler) fetchUsersForMessages(ctx context.Context, clien
 		user, err := client.GetUserInfoContext(ctx, userID)
 		if err != nil {
 			ch.logger.Debug("Failed to fetch user info", zap.String("userID", userID), zap.Error(err))
+			continue
+		}
+		if user == nil {
+			ch.logger.Debug("User info returned nil", zap.String("userID", userID))
 			continue
 		}
 		usersMap[userID] = *user

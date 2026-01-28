@@ -404,12 +404,39 @@ func (ch *ChannelsHandler) channelsHandlerOAuth(ctx context.Context, request mcp
 		}
 
 		for _, c := range channels {
+			name := "#" + c.Name
+			memberCount := c.NumMembers
+
+			// Handle DM channels - they have empty names but have a User field
+			if c.IsIM && c.User != "" {
+				// Fetch user info to get their display name
+				user, err := client.GetUserInfo(c.User)
+				if err != nil {
+					ch.logger.Debug("Failed to get user info for DM", zap.String("userID", c.User), zap.Error(err))
+					name = "@" + c.User // Fallback to user ID
+				} else if user != nil {
+					if user.Profile.DisplayName != "" {
+						name = "@" + user.Profile.DisplayName
+					} else {
+						name = "@" + user.Name
+					}
+				}
+				memberCount = 2 // DMs always have 2 members
+			} else if c.IsMpIM {
+				// Group DMs - use the purpose or a placeholder
+				if c.Purpose.Value != "" {
+					name = c.Purpose.Value
+				} else {
+					name = "Group DM"
+				}
+			}
+
 			allChannels = append(allChannels, Channel{
 				ID:          c.ID,
-				Name:        "#" + c.Name,
+				Name:        name,
 				Topic:       c.Topic.Value,
 				Purpose:     c.Purpose.Value,
-				MemberCount: c.NumMembers,
+				MemberCount: memberCount,
 			})
 		}
 	}
