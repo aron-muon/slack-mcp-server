@@ -531,7 +531,7 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		slackClient = client
 	}
 
-	params, err := ch.parseParamsToolSearch(request)
+	params, err := ch.parseParamsToolSearch(ctx, slackClient, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse search params", zap.Error(err))
 		return nil, err
@@ -675,6 +675,10 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 			if msg.User != "" {
 				userIDs = append(userIDs, msg.User)
 			}
+			// Also collect user IDs from DM channel names (they appear as user IDs like U1234)
+			if strings.HasPrefix(msg.Channel.Name, "U") {
+				userIDs = append(userIDs, msg.Channel.Name)
+			}
 		}
 		usersMap = ch.fetchUsersForMessages(ctx, slackClient, userIDs)
 	}
@@ -700,13 +704,34 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 
 		msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
 
+		// Format channel name properly
+		channelDisplay := fmt.Sprintf("#%s", msg.Channel.Name)
+		// Check if this is a DM (channel ID starts with D) or if the name looks like a user ID
+		if strings.HasPrefix(msg.Channel.ID, "D") || strings.HasPrefix(msg.Channel.Name, "U") {
+			// This is a DM - try to get the user's name
+			if strings.HasPrefix(msg.Channel.Name, "U") {
+				// The "name" is actually a user ID - look it up
+				if user, exists := usersMap[msg.Channel.Name]; exists {
+					if user.Profile.DisplayName != "" {
+						channelDisplay = "@" + user.Profile.DisplayName
+					} else {
+						channelDisplay = "@" + user.Name
+					}
+				} else {
+					channelDisplay = "@" + msg.Channel.Name
+				}
+			} else {
+				channelDisplay = "@" + msg.Channel.Name
+			}
+		}
+
 		messages = append(messages, Message{
 			MsgID:     msg.Timestamp,
 			UserID:    msg.User,
 			UserName:  userName,
 			RealName:  realName,
 			Text:      text.ProcessText(msgText),
-			Channel:   fmt.Sprintf("#%s", msg.Channel.Name),
+			Channel:   channelDisplay,
 			ThreadTs:  threadTs,
 			Time:      timestamp,
 			Reactions: "",
@@ -866,7 +891,7 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 	}, nil
 }
 
-func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (*searchParams, error) {
+func (ch *ConversationsHandler) parseParamsToolSearch(ctx context.Context, slackClient *slack.Client, req mcp.CallToolRequest) (*searchParams, error) {
 	rawQuery := strings.TrimSpace(req.GetString("search_query", ""))
 	freeText, filters := splitQuery(rawQuery)
 
@@ -874,14 +899,14 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "is", "thread")
 	}
 	if chName := req.GetString("filter_in_channel", ""); chName != "" {
-		f, err := ch.paramFormatChannel(chName)
+		f, err := ch.paramFormatChannel(ctx, slackClient, chName)
 		if err != nil {
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
 			return nil, err
 		}
 		addFilter(filters, "in", f)
 	} else if im := req.GetString("filter_in_im_or_mpim", ""); im != "" {
-		f, err := ch.paramFormatUser(im)
+		f, err := ch.paramFormatUser(ctx, slackClient, im)
 		if err != nil {
 			ch.logger.Error("Invalid IM/MPIM filter", zap.String("filter", im), zap.Error(err))
 			return nil, err
@@ -889,7 +914,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "in", f)
 	}
 	if with := req.GetString("filter_users_with", ""); with != "" {
-		f, err := ch.paramFormatUser(with)
+		f, err := ch.paramFormatUser(ctx, slackClient, with)
 		if err != nil {
 			ch.logger.Error("Invalid with-user filter", zap.String("filter", with), zap.Error(err))
 			return nil, err
@@ -897,7 +922,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "with", f)
 	}
 	if from := req.GetString("filter_users_from", ""); from != "" {
-		f, err := ch.paramFormatUser(from)
+		f, err := ch.paramFormatUser(ctx, slackClient, from)
 		if err != nil {
 			ch.logger.Error("Invalid from-user filter", zap.String("filter", from), zap.Error(err))
 			return nil, err
@@ -959,31 +984,45 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	}, nil
 }
 
-func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
-	if ch.oauthEnabled {
-		// OAuth mode: require user IDs, not names
-		raw = strings.TrimSpace(raw)
-		if strings.HasPrefix(raw, "U") {
-			return fmt.Sprintf("<@%s>", raw), nil
-		}
-		return "", fmt.Errorf("in OAuth mode, please use user ID (U...) instead of name: %s", raw)
-	}
-	
-	users := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) paramFormatUser(ctx context.Context, slackClient *slack.Client, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
+
+	// Handle user ID directly
 	if strings.HasPrefix(raw, "U") {
-		u, ok := users.Users[raw]
-		if !ok {
-			return "", fmt.Errorf("user %q not found", raw)
-		}
-		return fmt.Sprintf("<@%s>", u.ID), nil
+		return fmt.Sprintf("<@%s>", raw), nil
 	}
+
+	// Strip @ prefix if present
 	if strings.HasPrefix(raw, "<@") {
 		raw = raw[2:]
+		if idx := strings.Index(raw, ">"); idx >= 0 {
+			raw = raw[:idx]
+		}
+		return fmt.Sprintf("<@%s>", raw), nil
 	}
 	if strings.HasPrefix(raw, "@") {
 		raw = raw[1:]
 	}
+
+	if ch.oauthEnabled {
+		// OAuth mode: resolve username to user ID via Slack API
+		if slackClient == nil {
+			return "", fmt.Errorf("slack client is nil")
+		}
+		users, err := slackClient.GetUsersContext(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to get users: %w", err)
+		}
+		for _, user := range users {
+			if user.Name == raw || user.Profile.DisplayName == raw {
+				return fmt.Sprintf("<@%s>", user.ID), nil
+			}
+		}
+		return "", fmt.Errorf("user %q not found", raw)
+	}
+
+	// Legacy mode: use cached users
+	users := ch.apiProvider.ProvideUsersMap()
 	uid, ok := users.UsersInv[raw]
 	if !ok {
 		return "", fmt.Errorf("user %q not found", raw)
@@ -991,32 +1030,67 @@ func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
 	return fmt.Sprintf("<@%s>", uid), nil
 }
 
-func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
+func (ch *ConversationsHandler) paramFormatChannel(ctx context.Context, slackClient *slack.Client, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
-	
-	if ch.oauthEnabled {
-		// OAuth mode: use channel ID directly
-		if strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
+
+	// Handle channel ID directly - for search, we need the channel name
+	if strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
+		if ch.oauthEnabled {
+			// In OAuth mode with a channel ID, we need to get the channel name for search
+			if slackClient != nil {
+				info, err := slackClient.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+					ChannelID: raw,
+				})
+				if err == nil && info != nil {
+					return info.Name, nil
+				}
+			}
+			// Fallback: use the ID (search might still work)
 			return raw, nil
 		}
-		return "", fmt.Errorf("in OAuth mode, please use channel ID (C... or G...) instead of name: %s", raw)
-	}
-	
-	cms := ch.apiProvider.ProvideChannelsMaps()
-	if strings.HasPrefix(raw, "#") {
-		if id, ok := cms.ChannelsInv[raw]; ok {
-			return cms.Channels[id].Name, nil
-		}
-		return "", fmt.Errorf("channel %q not found", raw)
-	}
-	// Handle both C (standard channels) and G (private groups/channels) prefixes
-	if strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
+		// Legacy mode: look up name from cache
+		cms := ch.apiProvider.ProvideChannelsMaps()
 		if chn, ok := cms.Channels[raw]; ok {
 			return chn.Name, nil
 		}
-		return "", fmt.Errorf("channel %q not found", raw)
+		return raw, nil // Fallback to ID
 	}
-	return "", fmt.Errorf("invalid channel format: %q", raw)
+
+	// Handle channel name
+	name := strings.TrimPrefix(raw, "#")
+
+	if ch.oauthEnabled {
+		// OAuth mode: resolve channel name via Slack API (just validate it exists)
+		if slackClient == nil {
+			return "", fmt.Errorf("slack client is nil")
+		}
+		// Search for the channel to validate it exists
+		channelTypes := []string{"public_channel", "private_channel"}
+		for _, chanType := range channelTypes {
+			params := &slack.GetConversationsParameters{
+				Types: []string{chanType},
+				Limit: 200,
+			}
+			channels, _, err := slackClient.GetConversationsContext(ctx, params)
+			if err != nil {
+				continue
+			}
+			for _, c := range channels {
+				if c.Name == name {
+					return c.Name, nil
+				}
+			}
+		}
+		// Channel not found but try using the name anyway (might be in later pages)
+		return name, nil
+	}
+
+	// Legacy mode: look up from cache
+	cms := ch.apiProvider.ProvideChannelsMaps()
+	if id, ok := cms.ChannelsInv[raw]; ok {
+		return cms.Channels[id].Name, nil
+	}
+	return "", fmt.Errorf("channel %q not found", raw)
 }
 
 func marshalMessagesToCSV(messages []Message) (*mcp.CallToolResult, error) {
