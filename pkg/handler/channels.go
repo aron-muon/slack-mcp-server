@@ -421,13 +421,23 @@ func (ch *ChannelsHandler) channelsHandlerOAuth(ctx context.Context, request mcp
 						name = "@" + user.Name
 					}
 				}
-				memberCount = 2 // DMs always have 2 members
+				memberCount = 2 // 1:1 DMs always have exactly 2 members
 			} else if c.IsMpIM {
 				// Group DMs - use the purpose or a placeholder
 				if c.Purpose.Value != "" {
 					name = c.Purpose.Value
 				} else {
 					name = "Group DM"
+				}
+				// Get actual member count for group DMs
+				members, _, err := client.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+					ChannelID: c.ID,
+					Limit:     1000,
+				})
+				if err != nil {
+					ch.logger.Debug("Failed to get members for MPIM", zap.String("channelID", c.ID), zap.Error(err))
+				} else {
+					memberCount = len(members)
 				}
 			}
 

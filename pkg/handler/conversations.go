@@ -159,6 +159,72 @@ func (h *ConversationsHandler) getProvider() (*provider.ApiProvider, error) {
 	return h.apiProvider, nil
 }
 
+// resolveChannelName resolves a channel name (e.g., "#general" or "@username") to a channel ID
+// using the Slack API. This is used in OAuth mode where there's no channel cache.
+func (h *ConversationsHandler) resolveChannelName(ctx context.Context, client *slack.Client, channelName string) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("slack client is nil")
+	}
+
+	// Handle @username for DMs
+	if strings.HasPrefix(channelName, "@") {
+		username := strings.TrimPrefix(channelName, "@")
+		// Look up user by name
+		users, err := client.GetUsersContext(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to get users: %w", err)
+		}
+		for _, user := range users {
+			if user.Name == username || user.Profile.DisplayName == username {
+				// Open a DM with this user
+				channel, _, _, err := client.OpenConversationContext(ctx, &slack.OpenConversationParameters{
+					Users: []string{user.ID},
+				})
+				if err != nil {
+					return "", fmt.Errorf("failed to open DM with user %s: %w", username, err)
+				}
+				if channel == nil {
+					return "", fmt.Errorf("failed to open DM with user %s: nil channel returned", username)
+				}
+				return channel.ID, nil
+			}
+		}
+		return "", fmt.Errorf("user %q not found", username)
+	}
+
+	// Handle #channel-name
+	name := strings.TrimPrefix(channelName, "#")
+
+	// Search through public and private channels
+	channelTypes := []string{"public_channel", "private_channel"}
+	for _, chanType := range channelTypes {
+		cursor := ""
+		for {
+			params := &slack.GetConversationsParameters{
+				Types:  []string{chanType},
+				Limit:  200,
+				Cursor: cursor,
+			}
+			channels, nextCursor, err := client.GetConversationsContext(ctx, params)
+			if err != nil {
+				h.logger.Debug("Failed to get conversations", zap.String("type", chanType), zap.Error(err))
+				break
+			}
+			for _, c := range channels {
+				if c.Name == name {
+					return c.ID, nil
+				}
+			}
+			if nextCursor == "" {
+				break
+			}
+			cursor = nextCursor
+		}
+	}
+
+	return "", fmt.Errorf("channel %q not found", channelName)
+}
+
 // UsersResource streams a CSV of all users
 func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	ch.logger.Debug("UsersResource called", zap.Any("params", request.Params))
@@ -346,7 +412,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 		slackClient = client
 	}
 
-	params, err := ch.parseParamsToolConversations(request)
+	params, err := ch.parseParamsToolConversations(ctx, slackClient, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse history params", zap.Error(err))
 		return nil, err
@@ -410,7 +476,7 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		slackClient = client
 	}
 
-	params, err := ch.parseParamsToolConversations(request)
+	params, err := ch.parseParamsToolConversations(ctx, slackClient, request)
 	if err != nil {
 		ch.logger.Error("Failed to parse replies params", zap.Error(err))
 		return nil, err
@@ -660,7 +726,7 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 	return messages
 }
 
-func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToolRequest) (*conversationParams, error) {
+func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context, slackClient *slack.Client, request mcp.CallToolRequest) (*conversationParams, error) {
 	channel := request.GetString("channel_id", "")
 	if channel == "" {
 		ch.logger.Error("channel_id missing in conversations params")
@@ -692,33 +758,40 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	}
 
 	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		// OAuth mode doesn't have a channel cache - require channel IDs
+		// OAuth mode: resolve channel name to ID using Slack API
 		if ch.oauthEnabled {
-			ch.logger.Error("Channel name not supported in OAuth mode", zap.String("channel", channel))
-			return nil, fmt.Errorf("channel name %q is not supported in OAuth mode. Please use the channel ID (e.g., 'C1234567890') instead. You can get channel IDs from the channels_list tool", channel)
-		}
-		if ready, err := ch.apiProvider.IsReady(); !ready {
-			if errors.Is(err, provider.ErrUsersNotReady) {
-				ch.logger.Warn(
-					"WARNING: Slack users sync is not ready yet, you may experience some limited functionality and see UIDs instead of resolved names as well as unable to query users by their @handles. Users sync is part of channels sync and operations on channels depend on users collection (IM, MPIM). Please wait until users are synced and try again",
-					zap.Error(err),
-				)
+			ch.logger.Debug("Resolving channel name in OAuth mode", zap.String("channel", channel))
+			resolvedID, err := ch.resolveChannelName(ctx, slackClient, channel)
+			if err != nil {
+				ch.logger.Error("Failed to resolve channel name", zap.String("channel", channel), zap.Error(err))
+				return nil, fmt.Errorf("failed to resolve channel name %q: %w", channel, err)
 			}
-			if errors.Is(err, provider.ErrChannelsNotReady) {
-				ch.logger.Warn(
-					"WARNING: Slack channels sync is not ready yet, you may experience some limited functionality and be able to request conversation only by Channel ID, not by its name. Please wait until channels are synced and try again.",
-					zap.Error(err),
-				)
+			channel = resolvedID
+		} else {
+			// Legacy mode: use channel cache
+			if ready, err := ch.apiProvider.IsReady(); !ready {
+				if errors.Is(err, provider.ErrUsersNotReady) {
+					ch.logger.Warn(
+						"WARNING: Slack users sync is not ready yet, you may experience some limited functionality and see UIDs instead of resolved names as well as unable to query users by their @handles. Users sync is part of channels sync and operations on channels depend on users collection (IM, MPIM). Please wait until users are synced and try again",
+						zap.Error(err),
+					)
+				}
+				if errors.Is(err, provider.ErrChannelsNotReady) {
+					ch.logger.Warn(
+						"WARNING: Slack channels sync is not ready yet, you may experience some limited functionality and be able to request conversation only by Channel ID, not by its name. Please wait until channels are synced and try again.",
+						zap.Error(err),
+					)
+				}
+				return nil, fmt.Errorf("channel %q not found in empty cache", channel)
 			}
-			return nil, fmt.Errorf("channel %q not found in empty cache", channel)
+			channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+			chn, ok := channelsMaps.ChannelsInv[channel]
+			if !ok {
+				ch.logger.Error("Channel not found in synced cache", zap.String("channel", channel))
+				return nil, fmt.Errorf("channel %q not found in synced cache. Try to remove old cache file and restart MCP Server", channel)
+			}
+			channel = channelsMaps.Channels[chn].ID
 		}
-		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
-		chn, ok := channelsMaps.ChannelsInv[channel]
-		if !ok {
-			ch.logger.Error("Channel not found in synced cache", zap.String("channel", channel))
-			return nil, fmt.Errorf("channel %q not found in synced cache. Try to remove old cache file and restart MCP Server", channel)
-		}
-		channel = channelsMaps.Channels[chn].ID
 	}
 
 	return &conversationParams{
