@@ -415,7 +415,11 @@ func (ch *ChannelsHandler) channelsHandlerOAuth(ctx context.Context, request mcp
 					ch.logger.Debug("Failed to get user info for DM", zap.String("userID", c.User), zap.Error(err))
 					name = "@" + c.User // Fallback to user ID
 				} else if user != nil {
-					if user.Profile.DisplayName != "" {
+					// Priority: RealName (full name) → DisplayName → Name (username)
+					// This provides more consistent formatting across users
+					if user.RealName != "" {
+						name = "@" + user.RealName
+					} else if user.Profile.DisplayName != "" {
 						name = "@" + user.Profile.DisplayName
 					} else {
 						name = "@" + user.Name

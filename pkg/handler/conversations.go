@@ -596,10 +596,19 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, 
 		usersMap = cache.Users
 	} else {
 		// OAuth mode: fetch user info from Slack API
+		// Collect all user IDs from messages AND from mentions in message text
 		var userIDs []string
+		userMentionRe := regexp.MustCompile(`<@(U[A-Z0-9]+)(?:\|[^>]*)?>`)
 		for _, msg := range slackMessages {
 			if msg.User != "" {
 				userIDs = append(userIDs, msg.User)
+			}
+			// Extract user IDs from mentions in the text
+			matches := userMentionRe.FindAllStringSubmatch(msg.Text, -1)
+			for _, match := range matches {
+				if len(match) > 1 {
+					userIDs = append(userIDs, match[1])
+				}
 			}
 		}
 		usersMap = ch.fetchUsersForMessages(ctx, slackClient, userIDs)
@@ -629,6 +638,8 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, 
 		}
 
 		msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
+		// Expand user mentions to display names
+		msgText = expandUserMentions(msgText, usersMap)
 
 		var reactionParts []string
 		for _, r := range msg.Reactions {
@@ -670,7 +681,9 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 		usersMap = cache.Users
 	} else {
 		// OAuth mode: fetch user info from Slack API
+		// Collect all user IDs from messages AND from mentions in message text
 		var userIDs []string
+		userMentionRe := regexp.MustCompile(`<@(U[A-Z0-9]+)(?:\|[^>]*)?>`)
 		for _, msg := range slackMessages {
 			if msg.User != "" {
 				userIDs = append(userIDs, msg.User)
@@ -678,6 +691,13 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 			// Also collect user IDs from DM channel names (they appear as user IDs like U1234)
 			if strings.HasPrefix(msg.Channel.Name, "U") {
 				userIDs = append(userIDs, msg.Channel.Name)
+			}
+			// Extract user IDs from mentions in the text
+			matches := userMentionRe.FindAllStringSubmatch(msg.Text, -1)
+			for _, match := range matches {
+				if len(match) > 1 {
+					userIDs = append(userIDs, match[1])
+				}
 			}
 		}
 		usersMap = ch.fetchUsersForMessages(ctx, slackClient, userIDs)
@@ -703,6 +723,8 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 		}
 
 		msgText := msg.Text + text.AttachmentsTo2CSV(msg.Text, msg.Attachments)
+		// Expand user mentions to display names (search API may already do this, but be safe)
+		msgText = expandUserMentions(msgText, usersMap)
 
 		// Format channel name properly
 		channelDisplay := fmt.Sprintf("#%s", msg.Channel.Name)
@@ -712,7 +734,10 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 			if strings.HasPrefix(msg.Channel.Name, "U") {
 				// The "name" is actually a user ID - look it up
 				if user, exists := usersMap[msg.Channel.Name]; exists {
-					if user.Profile.DisplayName != "" {
+					// Priority: RealName → DisplayName → Name for consistent formatting
+					if user.RealName != "" {
+						channelDisplay = "@" + user.RealName
+					} else if user.Profile.DisplayName != "" {
 						channelDisplay = "@" + user.Profile.DisplayName
 					} else {
 						channelDisplay = "@" + user.Name
@@ -1146,6 +1171,47 @@ func (ch *ConversationsHandler) fetchUsersForMessages(ctx context.Context, clien
 
 func getBotInfo(botID string) (userName, realName string, ok bool) {
 	return botID, botID, true
+}
+
+// expandUserMentions replaces Slack user mentions (<@U1234567>) with display names (@Name)
+// using the provided users map. If a display name is already in the mention (<@U1234567|Name>),
+// it's handled by the text processor. This function handles the case where the mention
+// only contains the user ID.
+func expandUserMentions(text string, usersMap map[string]slack.User) string {
+	if usersMap == nil {
+		return text
+	}
+
+	// Match user mentions without display name: <@U1234567>
+	// Don't match mentions that already have display name: <@U1234567|Name>
+	userMentionRe := regexp.MustCompile(`<@(U[A-Z0-9]+)>`)
+
+	return userMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract user ID from <@U1234567>
+		submatch := userMentionRe.FindStringSubmatch(match)
+		if len(submatch) < 2 {
+			return match
+		}
+		userID := submatch[1]
+
+		// Look up user in map
+		if user, exists := usersMap[userID]; exists {
+			// Priority: RealName → DisplayName → Name for consistent formatting
+			name := user.RealName
+			if name == "" {
+				name = user.Profile.DisplayName
+			}
+			if name == "" {
+				name = user.Name
+			}
+			if name != "" {
+				return "@" + name
+			}
+		}
+
+		// Fallback to just the user ID
+		return "@" + userID
+	})
 }
 
 func limitByNumeric(limit string, defaultLimit int) (int, error) {
